@@ -16,6 +16,10 @@ export type UploadItem = {
 };
 
 type ActiveUpload = { uploadId?: string; aborters: Set<XMLHttpRequest>; cancelled: boolean };
+type PendingUpload = { file: File; folderId: string | null; id: string };
+
+const MAX_ACTIVE_FILES = 2;
+const PARTS_PER_BATCH = 2;
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return apiJson<T>(url, init);
@@ -65,6 +69,8 @@ async function withRetry<T>(operation: () => Promise<T>, attempts = 3) {
 export function useUploadQueue(onCompleted: () => void) {
   const [items, setItems] = useState<UploadItem[]>([]);
   const active = useRef(new Map<string, ActiveUpload>());
+  const pending = useRef<PendingUpload[]>([]);
+  const running = useRef(0);
 
   const patch = useCallback((id: string, update: Partial<UploadItem>) => {
     setItems((current) => current.map((item) => (item.id === id ? { ...item, ...update } : item)));
@@ -99,11 +105,11 @@ export function useUploadQueue(onCompleted: () => void) {
         const elapsed = Math.max(0.2, (now - startedAt) / 1000);
         patch(id, { loaded: totalLoaded, progress: Math.min(100, (totalLoaded / file.size) * 100), speed: totalLoaded / elapsed });
       };
-      // Signed URLs expire after 15 minutes. Request only the next four parts
+      // Signed URLs expire after 15 minutes. Request only the next two parts
       // so a large video starts transferring immediately and later URLs stay fresh.
-      for (let first = 1; first <= init.partCount; first += 4) {
+      for (let first = 1; first <= init.partCount; first += PARTS_PER_BATCH) {
         if (controller.cancelled) throw new DOMException("Отменено", "AbortError");
-        const partNumbers = Array.from({ length: Math.min(4, init.partCount - first + 1) }, (_, index) => first + index);
+        const partNumbers = Array.from({ length: Math.min(PARTS_PER_BATCH, init.partCount - first + 1) }, (_, index) => first + index);
         const result = await api<{ urls: Array<{ partNumber: number; url: string }> }>(`/api/uploads/${init.uploadId}/parts`, {
           method: "POST", body: JSON.stringify({ partNumbers }),
         });
@@ -143,18 +149,34 @@ export function useUploadQueue(onCompleted: () => void) {
     }
   }, [onCompleted, patch]);
 
+  const startPending = useCallback(() => {
+    while (running.current < MAX_ACTIVE_FILES && pending.current.length > 0) {
+      const next = pending.current.shift()!;
+      running.current += 1;
+      void uploadOne(next.file, next.folderId, next.id).finally(() => {
+        running.current -= 1;
+        startPending();
+      });
+    }
+  }, [uploadOne]);
+
   const addFiles = useCallback((files: File[], folderId: string | null) => {
     const additions = files.filter((file) => file.size > 0).map((file) => ({
       file,
       item: { id: crypto.randomUUID(), name: file.name, size: file.size, loaded: 0, progress: 0, speed: 0, state: "waiting" as const },
     }));
     setItems((current) => [...additions.map(({ item }) => item), ...current]);
-    additions.forEach(({ file, item }) => void uploadOne(file, folderId, item.id));
-  }, [uploadOne]);
+    pending.current.push(...additions.map(({ file, item }) => ({ file, folderId, id: item.id })));
+    startPending();
+  }, [startPending]);
 
   const cancel = useCallback(async (id: string) => {
     const controller = active.current.get(id);
-    if (!controller) return;
+    if (!controller) {
+      pending.current = pending.current.filter((item) => item.id !== id);
+      patch(id, { state: "cancelled" });
+      return;
+    }
     controller.cancelled = true;
     controller.aborters.forEach((xhr) => xhr.abort());
     if (controller.uploadId) await apiFetch(`/api/uploads/${controller.uploadId}/abort`, { method: "POST" }).catch(() => undefined);
@@ -165,4 +187,5 @@ export function useUploadQueue(onCompleted: () => void) {
   const dismiss = useCallback((id: string) => setItems((current) => current.filter((item) => item.id !== id)), []);
   return { items, addFiles, cancel, dismiss };
 }
+
 

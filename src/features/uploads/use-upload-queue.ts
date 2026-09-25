@@ -54,13 +54,13 @@ function putPart(url: string, blob: Blob, signalSet: Set<XMLHttpRequest>, onProg
   });
 }
 
-async function withRetry<T>(operation: () => Promise<T>, attempts = 3) {
+async function withRetry<T>(operation: () => Promise<T>, attempts = 5) {
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try { return await operation(); } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") throw error;
       lastError = error;
-      if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 700 * 2 ** attempt));
+      if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 1_000 * 2 ** attempt));
     }
   }
   throw lastError;
@@ -71,6 +71,8 @@ export function useUploadQueue(onCompleted: () => void) {
   const active = useRef(new Map<string, ActiveUpload>());
   const pending = useRef<PendingUpload[]>([]);
   const running = useRef(0);
+  const filesRef = useRef(new Map<string, { file: File; folderId: string | null }>());
+  const failed = useRef(new Set<string>());
 
   const patch = useCallback((id: string, update: Partial<UploadItem>) => {
     setItems((current) => current.map((item) => (item.id === id ? { ...item, ...update } : item)));
@@ -132,6 +134,7 @@ export function useUploadQueue(onCompleted: () => void) {
       completedUpload = true;
       localStorage.removeItem(`cloud-upload-${id}`);
       patch(id, { state: "completed", loaded: file.size, progress: 100, speed: 0 });
+      filesRef.current.delete(id);
       onCompleted();
     } catch (error) {
       controller.aborters.forEach((xhr) => xhr.abort());
@@ -141,7 +144,9 @@ export function useUploadQueue(onCompleted: () => void) {
       }
       if (controller.cancelled || (error instanceof DOMException && error.name === "AbortError")) {
         patch(id, { state: "cancelled", error: undefined });
+        filesRef.current.delete(id);
       } else {
+        failed.current.add(id);
         patch(id, { state: "error", error: error instanceof Error ? error.message : "Не удалось загрузить файл." });
       }
     } finally {
@@ -165,16 +170,28 @@ export function useUploadQueue(onCompleted: () => void) {
       file,
       item: { id: crypto.randomUUID(), name: file.name, size: file.size, loaded: 0, progress: 0, speed: 0, state: "waiting" as const },
     }));
+    additions.forEach(({ file, item }) => { filesRef.current.set(item.id, { file, folderId }); });
     setItems((current) => [...additions.map(({ item }) => item), ...current]);
     pending.current.push(...additions.map(({ file, item }) => ({ file, folderId, id: item.id })));
     startPending();
   }, [startPending]);
+
+  const retry = useCallback((id: string) => {
+    if (!failed.current.delete(id)) return;
+    const entry = filesRef.current.get(id);
+    if (!entry) return;
+    patch(id, { state: "waiting", loaded: 0, progress: 0, speed: 0, error: undefined, uploadId: undefined });
+    pending.current.push({ id, file: entry.file, folderId: entry.folderId });
+    startPending();
+  }, [patch, startPending]);
 
   const cancel = useCallback(async (id: string) => {
     const controller = active.current.get(id);
     if (!controller) {
       pending.current = pending.current.filter((item) => item.id !== id);
       patch(id, { state: "cancelled" });
+      failed.current.delete(id);
+      filesRef.current.delete(id);
       return;
     }
     controller.cancelled = true;
@@ -182,10 +199,16 @@ export function useUploadQueue(onCompleted: () => void) {
     if (controller.uploadId) await apiFetch(`/api/uploads/${controller.uploadId}/abort`, { method: "POST" }).catch(() => undefined);
     localStorage.removeItem(`cloud-upload-${id}`);
     patch(id, { state: "cancelled" });
+    failed.current.delete(id);
+    filesRef.current.delete(id);
   }, [patch]);
 
-  const dismiss = useCallback((id: string) => setItems((current) => current.filter((item) => item.id !== id)), []);
-  return { items, addFiles, cancel, dismiss };
+  const dismiss = useCallback((id: string) => {
+    failed.current.delete(id);
+    filesRef.current.delete(id);
+    setItems((current) => current.filter((item) => item.id !== id));
+  }, []);
+  return { items, addFiles, cancel, dismiss, retry };
 }
 
 

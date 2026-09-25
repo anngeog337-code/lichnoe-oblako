@@ -1,9 +1,9 @@
-import { Check, ChevronDown, Loader2, UploadCloud, X } from "lucide-react";
+import { Check, ChevronDown, Loader2, RotateCcw, UploadCloud, X } from "lucide-react";
 import { useState } from "react";
 import { formatBytes } from "@/lib/format";
 import type { UploadItem } from "@/features/uploads/use-upload-queue";
 
-export function UploadPanel({ items, onCancel, onDismiss }: { items: UploadItem[]; onCancel: (id: string) => void; onDismiss: (id: string) => void }) {
+export function UploadPanel({ items, onCancel, onDismiss, onRetry }: { items: UploadItem[]; onCancel: (id: string) => void; onDismiss: (id: string) => void; onRetry: (id: string) => void }) {
   const [collapsed, setCollapsed] = useState(false);
   if (!items.length) return null;
   const active = items.filter((item) => item.state === "preparing" || item.state === "uploading");
@@ -25,6 +25,7 @@ export function UploadPanel({ items, onCancel, onDismiss }: { items: UploadItem[
             <div className="upload-info"><strong title={item.name}>{item.name}</strong><span>
               {item.state === "waiting" ? "В очереди" : item.state === "preparing" ? "Подготовка…" : item.state === "completed" ? "Завершено" : item.state === "error" ? item.error : item.state === "cancelled" ? "Отменено" : `${formatBytes(item.loaded)} из ${formatBytes(item.size)} · ${formatBytes(item.speed)}/с`}
             </span><div className="mini-progress"><i style={{ width: `${item.progress}%` }} /></div></div>
+            {item.state === "error" && <button className="icon-button" onClick={() => onRetry(item.id)} aria-label={`Повторить загрузку ${item.name}`} title="Повторить загрузку"><RotateCcw size={16} /></button>}
             <button className="icon-button" onClick={() => ["completed", "error", "cancelled"].includes(item.state) ? onDismiss(item.id) : onCancel(item.id)} aria-label="Убрать или отменить"><X size={16} /></button>
           </article>
         ))}

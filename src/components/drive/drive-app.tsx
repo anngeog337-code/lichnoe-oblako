@@ -43,6 +43,22 @@ async function requestJson<T = unknown>(url: string, init?: RequestInit): Promis
   return apiJson<T>(url, init);
 }
 
+async function filesFromEntry(entry: FileSystemEntry): Promise<File[]> {
+  if (entry.isFile) {
+    return [await new Promise<File>((resolve, reject) =>
+      (entry as FileSystemFileEntry).file(resolve, reject)
+    )];
+  }
+  const reader = (entry as FileSystemDirectoryEntry).createReader();
+  const files: File[] = [];
+  for (;;) {
+    const batch = await new Promise<FileSystemEntry[]>((resolve, reject) => reader.readEntries(resolve, reject));
+    if (batch.length === 0) return files;
+    const nested = await Promise.all(batch.map(filesFromEntry));
+    files.push(...nested.flat());
+  }
+}
+
 function ResourceIcon({ resource, size = 20 }: { resource: DriveResource; size?: number }) {
   if (resource.kind === "folder") return <Folder size={size} className="folder-icon" fill="currentColor" />;
   if (resource.mimeType?.startsWith("image/")) return <FileImage size={size} className="image-icon" />;
@@ -63,7 +79,8 @@ export function DriveApp({ initialEmail }: { initialEmail: string }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [menuId, setMenuId] = useState<string | null>(null);
   const [mobileNav, setMobileNav] = useState(false);
-  const [dragDepth, setDragDepth] = useState(0);
+  const [draggingFiles, setDraggingFiles] = useState(false);
+  const dragTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [modal, setModal] = useState<Modal>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [dark, setDark] = useState(false);
@@ -90,6 +107,28 @@ export function DriveApp({ initialEmail }: { initialEmail: string }) {
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(null), 3200); return () => clearTimeout(timer); }, [toast]);
 
   const uploadQueue = useUploadQueue(refresh);
+  const clearDragOverlay = useCallback(() => {
+    if (dragTimer.current) clearTimeout(dragTimer.current);
+    dragTimer.current = null;
+    setDraggingFiles(false);
+  }, []);
+  const showDragOverlay = useCallback(() => {
+    if (dragTimer.current) clearTimeout(dragTimer.current);
+    setDraggingFiles(true);
+    // Some nested drop targets or browsers do not deliver a matching dragleave.
+    dragTimer.current = setTimeout(() => setDraggingFiles(false), 2_000);
+  }, []);
+  useEffect(() => {
+    window.addEventListener("drop", clearDragOverlay);
+    window.addEventListener("dragend", clearDragOverlay);
+    window.addEventListener("blur", clearDragOverlay);
+    return () => {
+      window.removeEventListener("drop", clearDragOverlay);
+      window.removeEventListener("dragend", clearDragOverlay);
+      window.removeEventListener("blur", clearDragOverlay);
+      if (dragTimer.current) clearTimeout(dragTimer.current);
+    };
+  }, [clearDragOverlay]);
   const resources = useMemo(() => data?.resources ?? [], [data]);
   const canWriteCurrentFolder = !folderId || Boolean(data?.profile?.id && data.currentFolderOwnerId === data.profile.id);
 
@@ -181,6 +220,9 @@ export function DriveApp({ initialEmail }: { initialEmail: string }) {
   }
 
   async function dropMove(event: React.DragEvent, targetFolderId: string | null) {
+    // External files can land on a folder row. Let that drop reach the root
+    // upload handler instead of swallowing it as an internal move.
+    if (event.dataTransfer.types.includes("Files")) return;
     event.preventDefault(); event.stopPropagation();
     const raw = event.dataTransfer.getData("application/x-cloud-resource");
     if (!raw) return;
@@ -188,10 +230,25 @@ export function DriveApp({ initialEmail }: { initialEmail: string }) {
     await mutate(resource, { action: "move", folderId: targetFolderId }, "Объект перемещён");
   }
 
-  function addDroppedFiles(event: React.DragEvent) {
-    event.preventDefault(); setDragDepth(0);
+  async function addDroppedFiles(event: React.DragEvent) {
+    event.preventDefault(); clearDragOverlay();
     if (!canWriteCurrentFolder) return showToast("В общую папку нельзя загружать файлы.");
-    if (event.dataTransfer.files.length) uploadQueue.addFiles(Array.from(event.dataTransfer.files), folderId);
+    const destination = folderId;
+    const directFiles = Array.from(event.dataTransfer.files);
+    const entries = Array.from(event.dataTransfer.items)
+      .map((item) => item.webkitGetAsEntry?.())
+      .filter((entry): entry is FileSystemEntry => Boolean(entry));
+    try {
+      const files = entries.some((entry) => entry.isDirectory)
+        ? (await Promise.all(entries.map(filesFromEntry))).flat()
+        : directFiles;
+      const uploadable = files.filter((file) => file.size > 0);
+      if (!uploadable.length) return showToast("Файлы не найдены. Попробуйте выбрать их кнопкой «Папку» или «Загрузить».");
+      uploadQueue.addFiles(uploadable, destination);
+      showToast(`Добавлено в очередь: ${uploadable.length}`);
+    } catch {
+      showToast("Не удалось прочитать перетаскиваемые файлы. Выберите их кнопкой «Папку» или «Загрузить».");
+    }
   }
 
   const usage = data?.usage ?? { usedBytes: 0, reservedBytes: 0, quotaBytes: 0 };
@@ -200,8 +257,8 @@ export function DriveApp({ initialEmail }: { initialEmail: string }) {
   const hasReadOnlySelection = resources.some((resource) => selected.has(resource.id) && resource.ownerId !== data?.profile?.id);
 
   return (
-    <div className="drive-shell" onDragEnter={(event) => { if (event.dataTransfer.types.includes("Files")) setDragDepth((value) => value + 1); }} onDragLeave={() => setDragDepth((value) => Math.max(0, value - 1))} onDragOver={(event) => event.preventDefault()} onDrop={addDroppedFiles}>
-      {dragDepth > 0 && <div className="drop-overlay"><Upload size={38} /><strong>Отпустите файлы для загрузки</strong><span>Они попадут в текущую папку</span></div>}
+    <div className="drive-shell" onDragEnter={(event) => { if (event.dataTransfer.types.includes("Files")) showDragOverlay(); }} onDragOver={(event) => { event.preventDefault(); if (event.dataTransfer.types.includes("Files")) showDragOverlay(); }} onDrop={(event) => void addDroppedFiles(event)}>
+      {draggingFiles && <div className="drop-overlay"><Upload size={38} /><strong>Отпустите файлы для загрузки</strong><span>Они попадут в текущую папку</span></div>}
       <aside className={`sidebar ${mobileNav ? "open" : ""}`}>
         <div className="sidebar-brand"><span className="brand-mark"><Cloud size={20} /></span><span>Личное облако</span><button className="icon-button mobile-only" onClick={() => setMobileNav(false)}><X size={19} /></button></div>
         <button className="create-button" disabled={!canWriteCurrentFolder} title={!canWriteCurrentFolder ? "Общая папка доступна только для просмотра" : undefined} onClick={() => setModal({ type: "create-folder" })}><Plus size={19} /> Создать <ChevronDown size={16} /></button>
@@ -460,4 +517,5 @@ function DriveModal({ modal, currentFolderId, onClose, onDone }: { modal: Exclud
     {shareNotice && <p className="form-success">{shareNotice}</p>}{error && <p className="form-message">{error}</p>}
   </div><footer><button type="button" className="secondary-button" onClick={onClose}>{shareUrl ? "Готово" : "Отмена"}</button>{!shareUrl && <button className="primary-button" disabled={busy || ((modal.type === "rename" || modal.type === "create-folder") && !value.trim())}>{busy && <Loader2 size={16} className="spin" />}{modal.type === "share" ? "Создать ссылку" : "Сохранить"}</button>}</footer></form></div>;
 }
+
 

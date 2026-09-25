@@ -315,7 +315,7 @@ export function DriveApp({ initialEmail }: { initialEmail: string }) {
           {data?.hasMore && <div className="load-more"><button className="secondary-button" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore && <Loader2 size={16} className="spin" />}Показать ещё</button></div>}
         </section>
       </main>
-      <UploadPanel items={uploadQueue.items} onCancel={(id) => void uploadQueue.cancel(id)} onDismiss={uploadQueue.dismiss} />
+      <UploadPanel items={uploadQueue.items} onCancel={(id) => void uploadQueue.cancel(id)} onDismiss={uploadQueue.dismiss} onRetry={uploadQueue.retry} />
       {toast && <div className="toast" role="status">{toast}</div>}
       {modal && (modal.type === "admin" ? <AdminModal onClose={() => setModal(null)} /> : <DriveModal modal={modal} currentFolderId={folderId} onClose={() => setModal(null)} onDone={async (message) => { setModal(null); showToast(message); setSelected(new Set()); await refresh(); }} />)}
     </div>

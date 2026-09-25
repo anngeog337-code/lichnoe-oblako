@@ -24,12 +24,20 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
 function putPart(url: string, blob: Blob, signalSet: Set<XMLHttpRequest>, onProgress: (loaded: number) => void) {
   return new Promise<string>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    let stalled = false;
+    let stallTimer: ReturnType<typeof setTimeout>;
+    const stopTimer = () => clearTimeout(stallTimer);
+    const watchProgress = () => {
+      stopTimer();
+      stallTimer = setTimeout(() => { stalled = true; xhr.abort(); }, 90_000);
+    };
     signalSet.add(xhr);
     xhr.open("PUT", url);
-    xhr.upload.onprogress = (event) => event.lengthComputable && onProgress(event.loaded);
-    xhr.onerror = () => { signalSet.delete(xhr); reject(new Error("Соединение прервано")); };
-    xhr.onabort = () => { signalSet.delete(xhr); reject(new DOMException("Отменено", "AbortError")); };
+    xhr.upload.onprogress = (event) => { watchProgress(); if (event.lengthComputable) onProgress(event.loaded); };
+    xhr.onerror = () => { stopTimer(); signalSet.delete(xhr); reject(new Error("Соединение прервано")); };
+    xhr.onabort = () => { stopTimer(); signalSet.delete(xhr); reject(stalled ? new Error("Загрузка остановилась: нет ответа от хранилища") : new DOMException("Отменено", "AbortError")); };
     xhr.onload = () => {
+      stopTimer();
       signalSet.delete(xhr);
       if (xhr.status < 200 || xhr.status >= 300) return reject(new Error(`Хранилище ответило ${xhr.status}`));
       const etag = xhr.getResponseHeader("ETag");
@@ -37,6 +45,7 @@ function putPart(url: string, blob: Blob, signalSet: Set<XMLHttpRequest>, onProg
       onProgress(blob.size);
       resolve(etag);
     };
+    watchProgress();
     xhr.send(blob);
   });
 }
@@ -66,6 +75,9 @@ export function useUploadQueue(onCompleted: () => void) {
     active.current.set(id, controller);
     const startedAt = performance.now();
     const partLoaded = new Map<number, number>();
+    let totalLoaded = 0;
+    let lastProgressUpdate = 0;
+    let completedUpload = false;
     try {
       patch(id, { state: "preparing" });
       const init = await api<UploadInitResponse>("/api/uploads/init", {
@@ -73,45 +85,54 @@ export function useUploadQueue(onCompleted: () => void) {
         body: JSON.stringify({ name: file.name, folderId, size: file.size, mimeType: file.type || "application/octet-stream" }),
       });
       controller.uploadId = init.uploadId;
+      if (controller.cancelled) throw new DOMException("Отменено", "AbortError");
       patch(id, { state: "uploading", uploadId: init.uploadId });
       localStorage.setItem(`cloud-upload-${id}`, JSON.stringify({ uploadId: init.uploadId, name: file.name, size: file.size, lastModified: file.lastModified }));
 
-      const partNumbers = Array.from({ length: init.partCount }, (_, index) => index + 1);
-      const signed = new Map<number, string>();
-      for (let index = 0; index < partNumbers.length; index += 40) {
-        const batch = partNumbers.slice(index, index + 40);
-        const result = await api<{ urls: Array<{ partNumber: number; url: string }> }>(`/api/uploads/${init.uploadId}/parts`, {
-          method: "POST", body: JSON.stringify({ partNumbers: batch }),
-        });
-        result.urls.forEach((entry) => signed.set(entry.partNumber, entry.url));
-      }
-
       const completed: Array<{ partNumber: number; etag: string }> = [];
-      let cursor = 0;
       const updateProgress = (partNumber: number, loaded: number) => {
+        totalLoaded += loaded - (partLoaded.get(partNumber) ?? 0);
         partLoaded.set(partNumber, loaded);
-        const totalLoaded = Array.from(partLoaded.values()).reduce((sum, value) => sum + value, 0);
-        const elapsed = Math.max(0.2, (performance.now() - startedAt) / 1000);
+        const now = performance.now();
+        if (now - lastProgressUpdate < 200 && totalLoaded < file.size) return;
+        lastProgressUpdate = now;
+        const elapsed = Math.max(0.2, (now - startedAt) / 1000);
         patch(id, { loaded: totalLoaded, progress: Math.min(100, (totalLoaded / file.size) * 100), speed: totalLoaded / elapsed });
       };
-      const worker = async () => {
-        while (cursor < partNumbers.length && !controller.cancelled) {
-          const partNumber = partNumbers[cursor++];
+      // Signed URLs expire after 15 minutes. Request only the next four parts
+      // so a large video starts transferring immediately and later URLs stay fresh.
+      for (let first = 1; first <= init.partCount; first += 4) {
+        if (controller.cancelled) throw new DOMException("Отменено", "AbortError");
+        const partNumbers = Array.from({ length: Math.min(4, init.partCount - first + 1) }, (_, index) => first + index);
+        const result = await api<{ urls: Array<{ partNumber: number; url: string }> }>(`/api/uploads/${init.uploadId}/parts`, {
+          method: "POST", body: JSON.stringify({ partNumbers }),
+        });
+        if (controller.cancelled) throw new DOMException("Отменено", "AbortError");
+        const signed = new Map(result.urls.map((entry) => [entry.partNumber, entry.url]));
+        await Promise.all(partNumbers.map(async (partNumber) => {
           const start = (partNumber - 1) * init.partSize;
           const blob = file.slice(start, Math.min(file.size, start + init.partSize));
           const url = signed.get(partNumber);
           if (!url) throw new Error("Не получена ссылка для части файла");
-          const etag = await withRetry(() => putPart(url, blob, controller.aborters, (loaded) => updateProgress(partNumber, loaded)));
+          const etag = await withRetry(() => {
+            updateProgress(partNumber, 0);
+            return putPart(url, blob, controller.aborters, (loaded) => updateProgress(partNumber, loaded));
+          });
           completed.push({ partNumber, etag });
-        }
-      };
-      await Promise.all(Array.from({ length: Math.min(4, init.partCount) }, () => worker()));
+        }));
+      }
       if (controller.cancelled) throw new DOMException("Отменено", "AbortError");
       await api(`/api/uploads/${init.uploadId}/complete`, { method: "POST", body: JSON.stringify({ parts: completed }) });
+      completedUpload = true;
       localStorage.removeItem(`cloud-upload-${id}`);
       patch(id, { state: "completed", loaded: file.size, progress: 100, speed: 0 });
       onCompleted();
     } catch (error) {
+      controller.aborters.forEach((xhr) => xhr.abort());
+      if (controller.uploadId && !completedUpload) {
+        void apiFetch(`/api/uploads/${controller.uploadId}/abort`, { method: "POST" }).catch(() => undefined);
+        localStorage.removeItem(`cloud-upload-${id}`);
+      }
       if (controller.cancelled || (error instanceof DOMException && error.name === "AbortError")) {
         patch(id, { state: "cancelled", error: undefined });
       } else {
@@ -144,3 +165,4 @@ export function useUploadQueue(onCompleted: () => void) {
   const dismiss = useCallback((id: string) => setItems((current) => current.filter((item) => item.id !== id)), []);
   return { items, addFiles, cancel, dismiss };
 }
+

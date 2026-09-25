@@ -308,6 +308,9 @@ function AdminModal({ onClose }: { onClose: () => void }) {
   const [quotas, setQuotas] = useState<Record<string, string>>({});
   const [savingId, setSavingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [cleaning, setCleaning] = useState(false);
+  const [cleanupProgress, setCleanupProgress] = useState(0);
+  const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
   const load = useCallback(async () => {
     try {
       const result = await requestJson<AdminData>("/api/admin/usage");
@@ -325,14 +328,40 @@ function AdminModal({ onClose }: { onClose: () => void }) {
     finally { setSavingId(null); }
   }
 
-  return <div className="modal-backdrop" role="dialog" aria-modal="true" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><div className="modal admin-modal"><header><div><h2>Управление хранилищем</h2>{data && <small>{formatBytes(data.users.reduce((sum, user) => sum + user.usedBytes + user.reservedBytes, 0))} из {formatBytes(Number(data.settings.total_quota_bytes))}</small>}</div><button className="icon-button" onClick={onClose}><X size={19} /></button></header><div className="modal-content">
+  const staleUploads = data?.activeUploads.filter((upload) =>
+    (upload.status === "initiating" || upload.status === "uploading") &&
+    new Date(upload.created_at).getTime() < Date.now() - 7 * 24 * 60 * 60 * 1000
+  ) ?? [];
+
+  async function cleanupStaleUploads() {
+    if (!staleUploads.length || cleaning) return;
+    setCleaning(true); setCleanupProgress(0); setCleanupMessage(null); setError(null);
+    let cleared = 0;
+    try {
+      for (let index = 0; index < staleUploads.length; index += 2) {
+        const batch = staleUploads.slice(index, index + 2);
+        const results = await Promise.allSettled(batch.map((upload) =>
+          requestJson(`/api/uploads/${upload.id}/abort`, { method: "POST" })
+        ));
+        cleared += results.filter((result) => result.status === "fulfilled").length;
+        setCleanupProgress(Math.min(index + batch.length, staleUploads.length));
+      }
+      await load();
+      setCleanupMessage(`Отменено старых загрузок: ${cleared} из ${staleUploads.length}.`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось обновить статистику после очистки.");
+    } finally { setCleaning(false); }
+  }
+
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" onMouseDown={(event) => event.target === event.currentTarget && !cleaning && onClose()}><div className="modal admin-modal"><header><div><h2>Управление хранилищем</h2>{data && <small>{formatBytes(data.users.reduce((sum, user) => sum + user.usedBytes + user.reservedBytes, 0))} из {formatBytes(Number(data.settings.total_quota_bytes))}</small>}</div><button className="icon-button" onClick={onClose} disabled={cleaning}><X size={19} /></button></header><div className="modal-content">
     {!data && !error && <div className="loading-state"><Loader2 className="spin" /> Загружаем статистику…</div>}
     {data && <><section className="admin-summary"><div><span>Пользователи</span><strong>{data.users.filter((user) => user.isActive).length} / {data.settings.max_users}</strong></div><div><span>Активные загрузки</span><strong>{data.activeUploads.length}</strong></div><div><span>Корзина</span><strong>{data.settings.trash_retention_days} дней</strong></div></section>
       <section className="admin-section"><h3>Квоты пользователей</h3><div className="admin-users">{data.users.map((user) => <div key={user.id}><span className="admin-avatar">{(user.displayName ?? user.email).slice(0, 1).toUpperCase()}</span><span className="admin-user-copy"><strong>{user.displayName ?? user.email}</strong><small>{user.email} · занято {formatBytes(user.usedBytes)}{user.reservedBytes ? ` + ${formatBytes(user.reservedBytes)} в загрузке` : ""}</small></span><label><input type="number" min="0" max="500" step="1" value={quotas[user.id] ?? ""} onChange={(event) => setQuotas((current) => ({ ...current, [user.id]: event.target.value }))} /><span>ГБ</span></label><button className="secondary-button" disabled={savingId === user.id} onClick={() => void saveQuota(user.id)}>{savingId === user.id ? <Loader2 size={15} className="spin" /> : "Сохранить"}</button></div>)}</div></section>
-      {data.activeUploads.length > 0 && <section className="admin-section"><h3>Активные загрузки</h3><div className="activity-list">{data.activeUploads.map((upload) => { const user = data.users.find((candidate) => candidate.id === upload.owner_id); return <div key={upload.id}><span><strong>{formatBytes(Number(upload.total_size_bytes))} · {upload.status}</strong><small>{user?.displayName ?? user?.email ?? "Пользователь"}</small></span><time>{new Intl.DateTimeFormat("ru", { hour: "2-digit", minute: "2-digit" }).format(new Date(upload.created_at))}</time></div>; })}</div></section>}
+      {data.activeUploads.length > 0 && <section className="admin-section"><h3>Активные загрузки</h3>{staleUploads.length > 0 && <div><p className="modal-note">Старше 7 дней: {staleUploads.length}. Отмена удалит только незавершённые части файлов и освободит резерв.</p><button className="secondary-button" disabled={cleaning} onClick={() => void cleanupStaleUploads()}>{cleaning ? `Проверено ${cleanupProgress} из ${staleUploads.length}…` : "Очистить старые загрузки"}</button></div>}<div className="activity-list">{data.activeUploads.slice(0, 20).map((upload) => { const user = data.users.find((candidate) => candidate.id === upload.owner_id); return <div key={upload.id}><span><strong>{formatBytes(Number(upload.total_size_bytes))} · {upload.status}</strong><small>{user?.displayName ?? user?.email ?? "Пользователь"}</small></span><time>{new Intl.DateTimeFormat("ru", { dateStyle: "short", timeStyle: "short" }).format(new Date(upload.created_at))}</time></div>; })}</div>{data.activeUploads.length > 20 && <p className="modal-note">Показаны первые 20 из {data.activeUploads.length}.</p>}</section>}
+      {cleanupMessage && <p className="form-message" role="status">{cleanupMessage}</p>}
       <section className="admin-section"><h3>Последние действия</h3><div className="activity-list">{data.recentActivity.length ? data.recentActivity.map((item) => { const user = data.users.find((candidate) => candidate.id === item.user_id); return <div key={item.id}><span><strong>{EVENT_LABELS[item.event] ?? item.event}</strong><small>{user?.displayName ?? user?.email ?? "Пользователь"}</small></span><time>{new Intl.DateTimeFormat("ru", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(item.created_at))}</time></div>; }) : <p className="modal-note">Действий пока нет.</p>}</div></section></>}
     {error && <p className="form-message">{error}</p>}
-  </div><footer><button className="primary-button" onClick={onClose}>Готово</button></footer></div></div>;
+  </div><footer><button className="primary-button" onClick={onClose} disabled={cleaning}>Готово</button></footer></div></div>;
 }
 
 function DriveModal({ modal, currentFolderId, onClose, onDone }: { modal: Exclude<Modal, null | { type: "admin" }>; currentFolderId: string | null; onClose: () => void; onDone: (message: string) => void }) {
@@ -431,3 +460,4 @@ function DriveModal({ modal, currentFolderId, onClose, onDone }: { modal: Exclud
     {shareNotice && <p className="form-success">{shareNotice}</p>}{error && <p className="form-message">{error}</p>}
   </div><footer><button type="button" className="secondary-button" onClick={onClose}>{shareUrl ? "Готово" : "Отмена"}</button>{!shareUrl && <button className="primary-button" disabled={busy || ((modal.type === "rename" || modal.type === "create-folder") && !value.trim())}>{busy && <Loader2 size={16} className="spin" />}{modal.type === "share" ? "Создать ссылку" : "Сохранить"}</button>}</footer></form></div>;
 }
+

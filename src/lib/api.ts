@@ -7,13 +7,27 @@ function edgeUrl(path: string) {
 }
 
 export async function apiFetch(path: string, init?: RequestInit) {
-  const { data } = await requireSupabase().auth.getSession();
-  const token = data.session?.access_token;
-  const headers = new Headers(init?.headers);
-  if (!headers.has("Content-Type") && init?.body) headers.set("Content-Type", "application/json");
-  headers.set("apikey", publicConfig.key);
-  if (token) headers.set("Authorization", `Bearer ${token}`);
-  return fetch(edgeUrl(path), { ...init, headers, cache: "no-store" });
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(), 30_000);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeout.signal]) : timeout.signal;
+  try {
+    const session = requireSupabase().auth.getSession();
+    const { data } = await Promise.race([
+      session,
+      new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })),
+    ]);
+    const token = data.session?.access_token;
+    const headers = new Headers(init?.headers);
+    if (!headers.has("Content-Type") && init?.body) headers.set("Content-Type", "application/json");
+    headers.set("apikey", publicConfig.key);
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    return await fetch(edgeUrl(path), { ...init, headers, signal, cache: "no-store" });
+  } catch (error) {
+    if (timeout.signal.aborted) throw new Error("Сервер не ответил за 30 секунд. Проверьте соединение и повторите попытку.");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function apiJson<T = unknown>(path: string, init?: RequestInit): Promise<T> {
@@ -22,3 +36,4 @@ export async function apiJson<T = unknown>(path: string, init?: RequestInit): Pr
   if (!response.ok) throw new Error(body.message ?? "Не удалось выполнить операцию.");
   return body as T;
 }
+
